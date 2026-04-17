@@ -73,3 +73,33 @@ None of those apply to a `TINSID = :B1` lookup from a Java service pool.
 3. If there's a legitimate reporting-style caller that *does* need PARALLEL, fork it into a separate query path rather than hinting the hot-path lookup.
 
 Want me to put together the before/after `EXPLAIN PLAN` commands so Ganga can confirm the plan change before Manoj deploys?
+
+```
+Subject: Query Performance — Summary of Approach
+
+Hi all,
+
+Following today's discussions, here is a short summary of the approach Ganga and I are aligning on to address the recent query performance concerns.
+
+Immediate fixes
+- Correct the index hint syntax across queries where commas are used inside INDEX() hints — these were carried over from the legacy LS scripts and are not being honored as intended.
+- Remove PARALLEL hints from per-request queries where they are not appropriate.
+- Add the missing composite index on DIALMOD (MODSID) to eliminate the full-scan behavior observed under load.
+- Audit the EView / MView / AView / TView SQL files for the same hint and index patterns, since the issues appear in more than one place.
+
+Short-term approach
+- EView is currently returning matching counts and performing well. The proposal is to convert EView into a materialized view, refreshed nightly, and use it as the foundation for level-based queries.
+- MView requires additional work before it can follow the same path; we will continue reconciling counts first.
+- AView and TView are performing well in their current form.
+
+Next steps
+- Ganga and I will take the lead on the EView materialized view conversion and the index/hint cleanup.
+- We will share one or two working examples before expanding the approach more broadly.
+- Manoj will handle deployment once the changes are validated.
+
+Happy to discuss further in tomorrow's sync.
+
+Thanks,
+Santosh
+
+```
