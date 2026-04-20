@@ -1,3 +1,4 @@
+```
 Subject: Entity Team — Integration Approach for EAG + BOE (Pre-Meeting Summary)
 
 Hi Team,
@@ -47,3 +48,4 @@ Looking forward to the discussion tomorrow.
 
 Thanks,
 Santosh
+```
