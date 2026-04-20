@@ -255,3 +255,20 @@ Thanks,
 Santosh
 
 ```
+
+```
+Hi Sam,
+
+Wanted to run two small changes to Q_mft_ind_vals by you before I deploy.
+
+1. Add DETERMINISTIC to the function declaration. This tells Oracle it can reuse the function's result within a single SQL statement when the same (sid, fs) inputs come up more than once. Since the function gets called per row from the views, and many rows share the same inputs, this should cut down a meaningful chunk of the repeated executions against dialmod.
+
+2. Add a return statement to the WHEN OTHERS exception handler. Right now if an unexpected error hits, the function logs it and falls through without returning a value, which raises ORA-06503. Adding a return of zeros (same as the NO_DATA_FOUND handler right above it) makes the error path behave consistently instead of failing loudly.
+
+Both are one-line changes, no logic change, easy rollback. Combined with the index Christina added, this should give us a bit more headroom on CPU while we work on the longer-term view rework.
+
+Let me know if you have any concerns.
+
+Thanks,
+Santosh
+```
