@@ -171,3 +171,69 @@ That alone would change every future incident response.
 **Is it BOE:** Very unlikely, because BOE would connect as `BOADM` not `ENTITY`. But confirm by asking Christina for `PROGRAM` and `MACHINE` from `v$session` — that's the definitive check and takes her 10 seconds.
 
 Want me to draft the `v$session` diagnostic query as a Teams message to Christina, or put together a short proposal for adding `DBMS_APPLICATION_INFO` tagging to the entity-service so this is traceable next time?
+
+
+Good question. Let me explain what those SID values actually are, because it's easy to misread them.
+
+## What SID means
+
+**SID = Session Identifier** in Oracle's `v$session` view. It's a short-lived integer Oracle assigns to each connection when it logs in. Think of it as a slot number in Oracle's in-memory session table.
+
+Key properties:
+
+- **Not stable over time.** When a session disconnects, the SID gets recycled and handed to the next session that connects. SID 1075 today is not the same user/process as SID 1075 tomorrow.
+- **Not a user ID, not a process ID, not a pod ID.** It doesn't tell you *who* or *what* is connected — just that *something* is occupying that slot right now.
+- **Unique only within an instance at a given moment.** To uniquely identify a session over time you need `SID + SERIAL#` together (the Serial Number column in the screenshot) — that pair is what you pass to `ALTER SYSTEM KILL SESSION '1075,14635'`.
+
+## What your screenshot is showing
+
+Looking at the values: `1075, 525, 954, 829, 628, 945, 548, 942, 963, 1444, 301, 1302, 266, 1093, 1095, 19, 18, 417, 514, 415, 633, 1179, 1424, 375, 832` — these are just the slot numbers Oracle happened to assign to 25+ simultaneously-connected sessions.
+
+**What matters about them:**
+
+1. **They're all different** — meaning these are 25+ *separate connections*, not one session running many queries. This is Randall's point: "all those session IDs are unique."
+
+2. **They're all running the same SQL_ID (`5m47gcucxjfz3`)** — meaning 25+ separate connections are all executing (or waiting to execute) the same query simultaneously. That's the smoking gun for a connection-pool fan-out or a parallel batch job.
+
+3. **The wide numeric spread (18 up to 1444)** — Oracle assigns SIDs roughly in order of connection, reusing freed slots. A wide spread of SIDs usually means sessions connected at different times and have been accumulating; a tight cluster (e.g., 1440, 1441, 1442, 1443) would mean they all connected in a burst.
+
+   Here the spread is **wide**, which suggests these connections didn't all open at once — they've been holding open from various points in time and are now all stuck on the same query. Consistent with a connection pool that's grown over time and is now saturated.
+
+## What would actually tell you something useful
+
+SID alone is almost useless for root-cause analysis. The columns you actually need from `v$session` are:
+
+| Column | What it tells you |
+|---|---|
+| `USERNAME` | Oracle account (`ENTITY` — already shown, confirms Java service) |
+| `OSUSER` | OS account of client (container user vs BOADM) |
+| `MACHINE` | Hostname of client — **this is the pod name** |
+| `PROGRAM` | What software connected (`JDBC Thin Client`, `BusinessObjects`, `sqlplus`, `toad.exe`) |
+| `MODULE` / `ACTION` | App-level tags — null unless app sets them via `DBMS_APPLICATION_INFO` |
+| `CLIENT_IDENTIFIER` | App-level user tag — null unless app sets it |
+| `LOGON_TIME` | When this session connected — tells you if burst or slow accumulation |
+| `STATUS` | ACTIVE (running SQL now) vs INACTIVE (connected but idle between calls) |
+| `LAST_CALL_ET` | Seconds since the session last made a call — high values = stuck/hung |
+| `SQL_ID` | Current or last SQL (already shown in screenshot) |
+| `EVENT` | What the session is waiting on right now |
+
+## The one-liner to send Christina
+
+```sql
+SELECT sid, serial#, username, osuser, machine, program,
+       module, action, client_identifier,
+       status, last_call_et, logon_time, sql_id, event
+FROM   v$session
+WHERE  sql_id = '5m47gcucxjfz3'
+ORDER BY logon_time;
+```
+
+This will tell you in one shot:
+
+- **Which pods** (`MACHINE`) the connections are coming from
+- **Whether it's Java or BOE** (`PROGRAM`)
+- **When each connected** (`LOGON_TIME` — ordered)
+- **Whether they're actively running or just holding open** (`STATUS`, `LAST_CALL_ET`)
+- **What each is waiting on** (`EVENT`)
+
+The SIDs themselves are just labels. The `MACHINE` and `PROGRAM` columns will answer your "is it BOE?" question definitively.
