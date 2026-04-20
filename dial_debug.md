@@ -237,3 +237,21 @@ This will tell you in one shot:
 - **What each is waiting on** (`EVENT`)
 
 The SIDs themselves are just labels. The `MACHINE` and `PROGRAM` columns will answer your "is it BOE?" question definitively.
+
+```
+Hi Sam, good question. Let me share what we found.
+
+The mft = 1 filter isn't coming from the outer view SQL directly. It lives inside Q_mft_ind_vals, a PL/SQL function that's called per row via TABLE(Q_mft_ind_vals(coresid, corefs)) in EView. Inside the function, the hardcoded query is:
+
+  select sum(...), sum(...) from dialmod where modsid = sid and mft = 1;
+
+So every row of the outer view triggers one aggregate query against dialmod, filtered by modsid and mft. Under load, we had 28+ sessions all running variants of this query at the same time, doing full scans of a 16M-row table. That's what caused the CPU spike and blocking.
+
+The index on (modsid, mft) turned the full scan into a range scan, which is why the CPU dropped when Christina added it. But I agree with you that the underlying pattern, a function called per row, is worth revisiting. Inlining that aggregate as a set-based join is on our list as part of the view rework with Ganga.
+
+Happy to walk through the function and the calling view together if helpful. Your perspective on how legacy handles this rollup would be valuable since the function was carried over from the legacy side and we want to make sure we're replicating the right behavior.
+
+Thanks,
+Santosh
+
+```
