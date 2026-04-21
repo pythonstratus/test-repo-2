@@ -272,3 +272,34 @@ Let me know if you have any concerns.
 Thanks,
 Santosh
 ```
+
+
+Honest answer: **"Yes, you're correct" is technically right but incomplete.** If you just say "yes," Bryan will go build it as a straight delete + re-insert, and there are two footguns waiting.
+
+Here's what I'd add — kept short so it doesn't derail him:
+
+---
+
+**Suggested reply (short version):**
+
+> Yes, that's correct — ROID is part of the composite PK `(ROID, SEID)`, so JPA can't update it in place. Changing ROID requires delete + re-insert, wrapped in `@Transactional` so it's atomic.
+>
+> Two quick things to watch for when you build it:
+>
+> 1. **Guard against ORG crossover.** Since ORG is derived from the ROID prefix (859062 / 859162 / 859362 / 859462), if someone edits more than the last 2 digits they could accidentally move a user across ORGs. Worth rejecting any ROID change where `OrgType.fromRoid(oldRoid) != OrgType.fromRoid(newRoid)` unless that's explicitly intended.
+>
+> 2. **Carry over all non-key fields.** EACTIVE, PRIMARY_ROID, ELEVEL, PODCD, title, unix login, etc. — re-insert with the same values so the row is functionally identical except for the new ROID. Otherwise you risk the user ending up with ELEVEL=-2 and no access.
+>
+> Unix login isn't part of the PK so that one can still be updated in place normally.
+
+---
+
+**Why I wouldn't just say "yes":**
+
+- **Footgun #1 (ORG crossover):** The requirement says admins typically only modify the last 2 digits, but the UI will let them type anything. Without a guard, a typo turns a CF test user into a WI test user silently — and given the ORG Segmentation work you just shipped, that's exactly the kind of data-boundary bug you don't want introduced by the admin tool.
+
+- **Footgun #2 (losing non-key fields on re-insert):** This directly hits the "Assignment activation pattern" lesson from your earlier work — missing a field on re-insert leaves the user with ELEVEL=-2 and no access. Bryan may not have that context since he wasn't deep in the Change Role work.
+
+Both are one-sentence caveats, not a redesign. You're not second-guessing Bryan's approach, just flagging the two things that would bite him in testing.
+
+If you want it even shorter for Teams, drop the intro and just send the two numbered points with "Yes — quick things to watch for:" on top.
