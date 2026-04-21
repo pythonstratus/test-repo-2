@@ -303,3 +303,101 @@ Here's what I'd add — kept short so it doesn't derail him:
 Both are one-sentence caveats, not a redesign. You're not second-guessing Bryan's approach, just flagging the two things that would bite him in testing.
 
 If you want it even shorter for Teams, drop the intro and just send the two numbered points with "Yes — quick things to watch for:" on top.
+
+
+
+Here's a single patch you can apply. Three changes to your existing `BoeConnectionTester.java`:
+
+**1. Replace the `ExportFormat` enum** (fixes the XLSX MIME type):
+
+```java
+public enum ExportFormat {
+    PDF("application/pdf", "pdf"),
+    CSV("text/csv", "csv"),
+    XLSX("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx");
+
+    final String mimeType;
+    final String extension;
+
+    ExportFormat(String mimeType, String extension) {
+        this.mimeType = mimeType;
+        this.extension = extension;
+    }
+}
+```
+
+**2. Add these two methods** anywhere in the class (e.g., right after `exportDocument`):
+
+```java
+// ============================================================
+// Get the first report id inside a document (CSV/XLSX need this)
+// ============================================================
+private long getFirstReportId(WebClient webClient, String logonToken, long docId) {
+    String reportsJson = webClient.get()
+            .uri("/raylight/v1/documents/{docId}/reports", docId)
+            .header("X-SAP-LogonToken", logonToken)
+            .accept(MediaType.APPLICATION_JSON)
+            .retrieve()
+            .bodyToMono(String.class)
+            .timeout(Duration.ofSeconds(boeConfig.getReadTimeout()))
+            .block();
+
+    int idx = reportsJson.indexOf("\"id\":");
+    if (idx < 0) {
+        throw new RuntimeException("No reports found in document " + docId + ": " + reportsJson);
+    }
+    int start = idx + 5;
+    int end = start;
+    while (end < reportsJson.length() && Character.isDigit(reportsJson.charAt(end))) {
+        end++;
+    }
+    return Long.parseLong(reportsJson.substring(start, end).trim());
+}
+
+// ============================================================
+// Export a specific report tab (CSV / XLSX)
+// ============================================================
+private void exportReport(WebClient webClient, String logonToken, long docId, long reportId,
+                          ExportFormat format, Path outputPath) {
+    log.info("Exporting report {} of document {} as {} to {}", reportId, docId, format, outputPath);
+
+    DataBufferUtils.write(
+                    webClient.get()
+                            .uri("/raylight/v1/documents/{docId}/reports/{reportId}", docId, reportId)
+                            .header("X-SAP-LogonToken", logonToken)
+                            .header("Accept", format.mimeType)
+                            .retrieve()
+                            .bodyToFlux(DataBuffer.class),
+                    outputPath,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE)
+            .block(Duration.ofMinutes(10));
+
+    log.info("Wrote {} bytes to {}", outputPath.toFile().length(), outputPath.toAbsolutePath());
+}
+```
+
+**3. Replace Step 5 in `run()`** with:
+
+```java
+// ----- Step 5: Export a report -----
+long docId = 6408483L;
+printStep(5, "Exporting document " + docId + " as PDF, CSV, and Excel");
+
+Path pdfOut = Paths.get("report_" + docId + ".pdf");
+Path csvOut = Paths.get("report_" + docId + ".csv");
+Path xlsxOut = Paths.get("report_" + docId + ".xlsx");
+
+// PDF works at document level
+exportDocument(webClient, logonToken, docId, ExportFormat.PDF, pdfOut);
+
+// CSV and Excel require a specific report tab id
+long reportId = getFirstReportId(webClient, logonToken, docId);
+exportReport(webClient, logonToken, docId, reportId, ExportFormat.CSV, csvOut);
+exportReport(webClient, logonToken, docId, reportId, ExportFormat.XLSX, xlsxOut);
+
+printResult(true, "Exports complete: " + pdfOut + ", " + csvOut + ", " + xlsxOut);
+```
+
+That's the full patch — one enum change, two new methods, one updated Step 5 block. No other changes needed. Apply and rerun.
