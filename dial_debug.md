@@ -401,3 +401,112 @@ printResult(true, "Exports complete: " + pdfOut + ", " + csvOut + ", " + xlsxOut
 ```
 
 That's the full patch — one enum change, two new methods, one updated Step 5 block. No other changes needed. Apply and rerun.
+
+
+Found it. Look at Image 2, lines 53–58:
+
+```sql
+from trantrail
+where
+    tinsid = sid
+    and org in ('CF','AD','CP')
+    and status not in ('E','X')
+--and status = 'O' and cldt is NULL
+--order by status DESC;
+order by 2,3,7 desc, 8, 9 ;
+```
+
+The `ORDER BY` is using **positional references**: `2, 3, 7, 8, 9`. Counting the select list from Image 1 (lines 31–40):
+
+1. `rowid`
+2. `case when roid = ro then 1 else 2 end`
+3. `decode(status,'O',1,'C',2,'T',2,'R',3,4)`
+4. `status`
+5. `roid`
+6. `nvl(assnfld, TO_DATE('01/01/1900','mm/dd/yyyy'))`
+7. `nvl(assnro,  TO_DATE('01/01/1900','mm/dd/yyyy'))`
+8. `nvl(closedt, TO_DATE('01/01/1900','mm/dd/yyyy'))`
+9. `extrdt`
+
+So `ORDER BY 2,3,7 desc, 8, 9` sorts by the case expression, the decode, then `assnro` (date), `closedt` (date), `extrdt` (date). All dates. Safe.
+
+**But here's the real smoking gun** — look at Image 5, line 177, and Image 6, lines 177–178 and 189:
+
+```sql
+assndt >= least(table_assnro(i), table_assnfld(i))
+```
+
+And:
+
+```sql
+and assndt >= least(table_assnro(i), table_assnfld(i))) then
+```
+
+Both `table_assnro` and `table_assnfld` are collections of `trantrail.assnro%TYPE` and `trantrail.assnfld%TYPE` — **DATE** columns in TRANTRAIL. But wait: look back at Image 2 line 59–60 (commented out):
+
+```sql
+-- nvl(assnro,'01/01/1900') desc, closedt desc;
+-- nvl(assnfld,'01/01/1900'), closedt;
+```
+
+Those use **string literals** `'01/01/1900'` without `TO_DATE(...)`. That's the pattern of a function that has been edited sloppily over time. The active code at lines 37–39 does use `TO_DATE('01/01/1900','mm/dd/yyyy')`, which is fine.
+
+**The actual problem** is much simpler and it's on line 202:
+
+```sql
+EXCEPTION
+    when no_data_found then return('BxxxxLAAFAAAAAsAAA');
+    when others then
+        dbms_output.put_line('sqlcode: '||sqlcode||' ERRM: '||sqlerrm);
+        return('BxxxxLAAFAAAAAsAAA');
+END;
+```
+
+Good — the `when others` handler DOES have a `return`. So that matches the pattern you flagged before (ORA-06503 on missing return) — this one is actually OK.
+
+**So where is ORA-01858 coming from for you specifically?**
+
+Here's what I think is actually happening. Look at Image 2, line 54:
+
+```sql
+and org in ('CF','AD','CP')
+```
+
+`org` is `TRANTRAIL.ORG`, which I'd bet is CHAR(2) or VARCHAR2(2). That's a filter — not your issue.
+
+The `bulk collect` at lines 41–50 pulls 9 columns into 9 typed collections. None of those collections are numeric-from-character types **except potentially** `table_statnum` (line 18, `trantrail.cc%TYPE`) being populated from `decode(status,'O',1,'C',2,'T',2,'R',3,4)` at line 34.
+
+**Check the type of `TRANTRAIL.CC`.** If `CC` is NUMBER, that `decode` returns a NUMBER — fine. But if `TRANTRAIL.CC` is CHAR/VARCHAR2, the decode still returns a NUMBER (because the match values `1, 2, 2, 3, 4` are numeric literals), and Oracle has to **implicitly convert number-to-char** using your session's `NLS_NUMERIC_CHARACTERS`. In some NLS settings (European, for example, where the decimal separator is `,`), this conversion path can produce characters that then fail downstream comparisons with ORA-01858.
+
+More likely culprit though — **the `order by 2,3,7 desc, 8, 9` clause is incomplete**. Look carefully: `2,3,7 desc` — the `desc` only applies to column 7. Columns 2 and 3 sort ascending. But then `8, 9` — column 8 (`closedt`, a date) and column 9 (`extrdt`, a date) sort ascending. 
+
+No, that still doesn't give ORA-01858.
+
+Honestly, I've been reaching. Let me step back.
+
+**The most practical path forward** — you've now seen the whole function. There's nothing in this code that makes ORA-01858 obvious from the body alone. The error almost has to be coming from **data in TRANTRAIL that your session scans but your colleagues' sessions don't** — which the PARALLEL(16) + PARALLEL_ENABLE combo explains.
+
+Run this to prove it:
+
+```sql
+ALTER SESSION DISABLE PARALLEL QUERY;
+-- then rerun your query
+```
+
+If it works, you've confirmed it's parallel-slave-distribution exposing a bad TRANTRAIL row. Then to find the row:
+
+```sql
+SELECT tinsid, roid, status, assnro, assnfld, closedt, extrdt, org
+FROM trantrail
+WHERE tinsid IN (
+    SELECT tinsid FROM MVIEW_MV
+    WHERE m_status = '0'
+      AND m_roid BETWEEN 26133700 AND 26133799
+)
+AND org IN ('CF','AD','CP')
+AND status NOT IN ('E','X');
+```
+
+Then dump that to a CSV and scan for any `assnro`, `assnfld`, or `closedt` values that look off — a stored string that isn't a valid date representation, or an `extrdt` with corrupt bytes. Given your memory notes that `trantrail.extrdt` is the standard dedup key and this function orders by it, that column is a prime suspect for a corrupt value that only shows up in your parallel slave's scan range.
+
+This is also the kind of thing Brian would spot in 30 seconds since he owns the function — worth pinging him with a screenshot of your error and asking if he's seen it before. If anyone else has ever hit ORA-01858 on `trailmatch_orgsinside`, he'll know.
