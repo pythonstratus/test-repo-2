@@ -156,3 +156,57 @@ For testing the *messier* case (Thomas's exact screenshot scenario), pick a SEID
 That'll narrow you down to users like the one Thomas showed — staff users who also have a non-staff assignment. Probably your best bet for matching the exact bug report.
 
 Want me to also draft a quick `UPDATE` script to put a test SEID into the exact non-canonical state if your dev DB doesn't have a natural example? I'd want you to confirm before running it in any shared environment.
+
+
+# 3
+That's `ORA-01489` — `LISTAGG` is overflowing the 4000-byte VARCHAR2 limit because some SEIDs have too many roles to concatenate into one string.
+
+Two ways to fix it. I'd go with option 1 — it gets you the candidate list cleanly, and you can run a follow-up query to inspect role details for any specific SEID.
+
+**Option 1 — Drop LISTAGG, then drill into a chosen SEID separately**
+
+```sql
+SELECT
+    TRIM(SEID) AS SEID,
+    COUNT(*) AS TOTAL_ROLES,
+    SUM(CASE WHEN ELEVEL = -2 THEN 1 ELSE 0 END) AS DEACTIVATED_COUNT,
+    SUM(CASE WHEN ELEVEL >= 0 THEN 1 ELSE 0 END) AS ACTIVE_COUNT
+FROM ENTITY.ENTEMP
+WHERE TRIM(SEID) NOT IN ('88888', '99999')
+GROUP BY TRIM(SEID)
+HAVING SUM(CASE WHEN ELEVEL = -2 THEN 1 ELSE 0 END) >= 1
+   AND SUM(CASE WHEN ELEVEL >= 0 THEN 1 ELSE 0 END) >= 1
+ORDER BY TOTAL_ROLES DESC, SEID;
+```
+
+Then once you've picked a candidate SEID from the results, run this to see the role details:
+
+```sql
+SELECT SEID, ROID, ELEVEL, EACTIVE, PRIMARY_ROID, PODCD
+FROM ENTITY.ENTEMP
+WHERE TRIM(SEID) = TRIM('<paste_seid_here>')
+ORDER BY ELEVEL, ROID;
+```
+
+**Option 2 — Truncate LISTAGG with `ON OVERFLOW TRUNCATE` (Oracle 12.2+)**
+
+If you really want it all in one query:
+
+```sql
+LISTAGG(ROID || ' (E=' || ELEVEL || ',A=' || EACTIVE || ',P=' || PRIMARY_ROID || ')', '; '
+        ON OVERFLOW TRUNCATE '...' WITH COUNT)
+    WITHIN GROUP (ORDER BY ELEVEL) AS ROLE_DETAILS
+```
+
+This won't error — it'll truncate long strings and append `...(N more)` so you still know there are more rows.
+
+**Also — I noticed your screenshot shows `FROM ENTITY.ENTEMP`** but the schema we've been using is `ENTITYDEV`. Worth double-checking that's the right schema for your environment, or it might be returning data you don't expect.
+
+To narrow further to staff + non-staff combos like Thomas's screenshot:
+
+```sql
+HAVING SUM(CASE WHEN ELEVEL = -2 THEN 1 ELSE 0 END) >= 1
+   AND SUM(CASE WHEN ELEVEL >= 0 THEN 1 ELSE 0 END) >= 1
+   AND SUM(CASE WHEN TO_CHAR(ROID) LIKE '859062%' THEN 1 ELSE 0 END) >= 1
+   AND SUM(CASE WHEN TO_CHAR(ROID) NOT LIKE '859062%' THEN 1 ELSE 0 END) >= 1
+```
